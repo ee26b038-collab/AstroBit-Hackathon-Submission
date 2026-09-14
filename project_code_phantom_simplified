@@ -1,0 +1,376 @@
+import glob
+import os
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from astropy.timeseries import BoxLeastSquares
+from scipy.signal import savgol_filter
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, precision_recall_curve
+from sklearn.pipeline import make_pipeline
+
+warnings.filterwarnings("ignore")
+
+TRAIN_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\train_pack\train"
+DEV_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\dev_pack\dev"
+PRIVATE_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\private"
+
+'''---------------------------------------------------------------------------------------------------------------------------------------
+to visualize the light curve, we can plot the flux against time. We will only plot the good quality data points (where quality == 0).
+---------------------------------------------------------------------------------------------------------------------------------------'''
+PERIOD_MIN = 3.0
+PERIOD_MAX = 400.0
+N_COARSE = 20000       
+N_PEAKS = 8            
+N_FINE = 600          
+N_COARSE_QUICK = 3000 
+DURATIONS = np.array([0.05, 0.1, 0.2, 0.4, 0.8])  # days
+
+def sde(power, i):
+    med = np.nanmedian(power)
+    mad = np.nanmedian(np.abs(power - med))
+    return float((power[i] - med) / (1.4826 * mad)) if mad > 0 else 0.0
+
+def quick_search(t, f):
+    t_fast = t[::3]
+    f_fast = f[::3]
+    
+    if len(t_fast) < 300:
+        t_fast, f_fast = t, f
+
+    bls = BoxLeastSquares(t_fast, f_fast)
+    baseline = t_fast.max() - t_fast.min()
+    pmax = min(PERIOD_MAX, baseline / 3.0)
+    coarse = np.exp(np.linspace(np.log(PERIOD_MIN), np.log(pmax), N_COARSE_QUICK))
+    
+    res = bls.power(coarse, DURATIONS, objective="likelihood")
+    power = np.asarray(res.power)
+    i = int(np.nanargmax(power))
+    return {
+        "period": float(res.period[i]),
+        "t0": float(res.transit_time[i]),
+        "duration_hours": float(res.duration[i] * 24),
+        "sde": sde(power, i),
+    }
+
+def search(t, f, verbose=False):
+    bls = BoxLeastSquares(t, f)
+    baseline = t.max() - t.min()
+    pmax = min(PERIOD_MAX, baseline / 3.0)
+
+    coarse = np.exp(np.linspace(np.log(PERIOD_MIN), np.log(pmax), N_COARSE))
+    res = bls.power(coarse, DURATIONS, objective="likelihood")
+    power = np.asarray(res.power)
+
+    order = np.argsort(power)[::-1]
+    peaks, used = [], np.zeros(len(coarse), bool)
+    for i in order:
+        if used[i]:
+            continue
+        peaks.append(i)
+        lo = np.searchsorted(coarse, coarse[i] * 0.9)
+        hi = np.searchsorted(coarse, coarse[i] * 1.1)
+        used[lo:hi] = True
+        if len(peaks) >= N_PEAKS:
+            break
+
+    best = None
+    for i in peaks:
+        p0 = coarse[i]
+        width = 0.02 * p0
+        fine = np.linspace(p0 - width, p0 + width, N_FINE)
+        fine = fine[fine > PERIOD_MIN]
+        if len(fine) < 10:
+            continue
+
+        r = bls.power(fine, DURATIONS, objective="likelihood")
+        p = np.asarray(r.power)
+        j = int(np.nanargmax(p))
+        score = sde(power, i)
+
+        if best is None or score > best["sde"]:
+            best = {
+                "period": float(r.period[j]),
+                "depth_ppm": float(r.depth[j] * 1e6),
+                "duration_hours": float(r.duration[j] * 24),
+                "t0": float(r.transit_time[j]),
+                "sde": score,
+            }
+        if verbose:
+            print(f"  peak P={p0:8.3f} -> refined {r.period[j]:8.4f}  SDE {score:5.1f}")
+
+    return best or {"period": np.nan, "depth_ppm": np.nan, "duration_hours": np.nan, "t0": np.nan, "sde": 0.0}
+DETREND_WINDOW_DAYS = 1.0
+
+def load_and_normalise(df):
+    m = (df.quality.values == 0) & np.isfinite(df.flux.values)
+    t = df.time.values[m]
+    f = df.flux.values[m].astype(float)
+    q = df.quarter.values[m]
+    if len(t) < 1000:
+        return None, None, None
+
+    for qq in np.unique(q):
+        s = q == qq
+        med = np.median(f[s])
+        f[s] = f[s] / med if med > 0 else 1.0
+
+    order = np.argsort(t)
+    return t[order], f[order], q[order]
+
+def fit_trend(t, f, window_days, mask_transit=None, method="savgol"):
+    cadence = np.median(np.diff(t))
+    k = max(7, int(window_days / cadence) | 1)
+
+    fit_input = f.copy()
+    if mask_transit is not None and mask_transit.any():
+        fit_input[mask_transit] = np.nan
+        fit_input = pd.Series(fit_input).interpolate(limit_direction="both").values
+
+    if method == "savgol":
+        polyorder = min(2, k - 1)
+        trend = savgol_filter(fit_input, k, polyorder, mode="interp")
+    else:
+        trend = pd.Series(fit_input).rolling(k, center=True, min_periods=k // 3).median().values
+
+    return trend
+
+def iterative_clean(df, window_days=DETREND_WINDOW_DAYS, n_iter=2, quick_sde_floor=5.0):
+    t, f, q = load_and_normalise(df)
+    if t is None:
+        return None, None, None
+
+    mask_transit = None
+    for iteration in range(n_iter):
+        trend = fit_trend(t, f, window_days, mask_transit=mask_transit)
+        ok = np.isfinite(trend) & (trend > 0)
+        t_i, f_i = t[ok], f[ok] / trend[ok]
+
+        if iteration > 0 and mask_transit is not None and not mask_transit.any():
+            break
+
+        quick = quick_search(t_i, f_i)
+        if quick["sde"] < quick_sde_floor:
+            break
+
+        half_dur_phase = (quick["duration_hours"] / 24) / quick["period"] / 2
+        ph = ((t - quick["t0"]) / quick["period"]) % 1.0
+        ph = np.where(ph > 0.5, ph - 1, ph)
+        mask_transit = np.abs(ph) < (half_dur_phase * 1.5)
+
+    trend = fit_trend(t, f, window_days, mask_transit=mask_transit)
+    ok = np.isfinite(trend) & (trend > 0)
+    return t[ok], f[ok] / trend[ok], q[ok]
+
+files = sorted(glob.glob(f"{TRAIN_DIR}/*.parquet"))
+if files:
+    df_sample = pd.read_parquet(files[0])
+    t, f, q = iterative_clean(df_sample)
+    print(f"Success! {len(t)} cadences, scatter {np.std(f) * 1e6:.0f} ppm")
+
+def _phase(t, t0, period):
+    ph = ((t - t0) / period) % 1.0
+    return np.where(ph > 0.5, ph - 1, ph)
+
+def odd_even_consistency(t, f, period, t0, duration_hours):
+    half_dur = (duration_hours / 24) / 2
+    cycle = np.floor((t - t0) / period + 0.5)
+    ph = _phase(t, t0, period)
+    in_transit = np.abs(ph) < half_dur
+
+    odd = in_transit & (cycle % 2 == 1)
+    even = in_transit & (cycle % 2 == 0)
+    if odd.sum() < 3 or even.sum() < 3:
+        return np.nan
+
+    baseline_flux = np.median(f[~in_transit])
+    depth_odd = baseline_flux - np.median(f[odd])
+    depth_even = baseline_flux - np.median(f[even])
+    if depth_odd <= 0 or depth_even <= 0:
+        return np.nan
+    return float(abs(depth_odd - depth_even) / max(depth_odd, depth_even))
+
+def secondary_eclipse_depth_ppm(t, f, period, t0, duration_hours):
+    half_dur = (duration_hours / 24) / 2
+    ph = _phase(t, t0, period)
+    secondary_mask = np.abs(np.abs(ph) - 0.5) < half_dur
+    out_mask = np.abs(ph) > 3 * half_dur
+    if secondary_mask.sum() < 3 or out_mask.sum() < 10:
+        return np.nan
+    return float((np.median(f[out_mask]) - np.median(f[secondary_mask])) * 1e6)
+
+def quarter_recurrence(t, f, quarter, period, t0, duration_hours):
+    half_dur = (duration_hours / 24) / 2
+    ph = _phase(t, t0, period)
+    in_transit = np.abs(ph) < half_dur
+
+    hits, total = 0, 0
+    for qq in np.unique(quarter):
+        s = quarter == qq
+        if in_transit[s].sum() < 2:
+            continue  # this quarter never actually covered a transit
+        total += 1
+        out_of_transit = np.median(f[s & ~in_transit])
+        in_t = np.median(f[s & in_transit])
+        if out_of_transit - in_t > 0:
+            hits += 1
+    return hits / total if total > 0 else np.nan
+
+FEATURE_COLS = ["sde", "depth_ppm", "duration_hours",
+                "odd_even_frac_diff", "secondary_depth_ppm", "quarter_recurrence"]
+
+def extract_features(t, f, q, candidate):
+    period, t0, duration_hours = candidate["period"], candidate["t0"], candidate["duration_hours"]
+    if not np.isfinite(period):
+        return {c: np.nan for c in FEATURE_COLS} | {"sde": candidate.get("sde", 0.0)}
+    return {
+        "sde": candidate["sde"],
+        "depth_ppm": candidate["depth_ppm"],
+        "duration_hours": duration_hours,
+        "odd_even_frac_diff": odd_even_consistency(t, f, period, t0, duration_hours),
+        "secondary_depth_ppm": secondary_eclipse_depth_ppm(t, f, period, t0, duration_hours),
+        "quarter_recurrence": quarter_recurrence(t, f, q, period, t0, duration_hours),
+    }
+
+N_TRAIN_SAMPLE = 269
+
+train_files = sorted(glob.glob(f"{TRAIN_DIR}/*.parquet"))[:N_TRAIN_SAMPLE]
+train_labels = pd.read_csv("C:/Users/Roopsundar/OneDrive/Desktop/project/Python/train_pack/train_labels.csv") #'''change the dir'''
+train_truth = pd.read_csv("C:/Users/Roopsundar/OneDrive/Desktop/project/Python/train_pack/train_truth.csv") #'''change the dir'''
+
+rows = []
+for i, path in enumerate(train_files, 1):
+    sid = os.path.basename(path)[:-8]
+    kepid = int(sid.replace("KIC_", ""))
+    t_i, f_i, q_i = iterative_clean(pd.read_parquet(path))
+    if t_i is None:
+        continue
+    cand = search(t_i, f_i)
+    row = extract_features(t_i, f_i, q_i, cand)
+    row["star_id"], row["kepid"] = sid, kepid
+    rows.append(row)
+    print(f"  [Train {i}/{len(train_files)}] {sid} SDE {cand['sde']:.1f}", flush=True)
+
+train_feat = pd.DataFrame(rows)
+train_feat = train_feat.merge(train_labels[["kepid", "label"]], on="kepid", how="left")
+train_feat = train_feat.merge(train_truth[["kepid", "injected"]], on="kepid", how="left")
+train_feat["injected"] = train_feat.injected.fillna(0)
+train_feat["has_planet"] = ((train_feat.label == 1) | (train_feat.injected == 1)).astype(int)
+
+print(f"\n{train_feat.has_planet.sum()} / {len(train_feat)} training stars have a planet")
+
+clf = make_pipeline(
+    SimpleImputer(strategy="median"),
+    LogisticRegression(class_weight="balanced", max_iter=1000),
+)
+clf.fit(train_feat[FEATURE_COLS], train_feat["has_planet"])
+
+coefs = clf.named_steps["logisticregression"].coef_[0]
+print("\nModel Feature Priorities:")
+for name, c in sorted(zip(FEATURE_COLS, coefs), key=lambda x: -abs(x[1])):
+    print(f"  {name:>20}  {c:+.3f}")
+
+N_SAMPLE = 89  # Scale up once execution runtimes look nominal
+
+dev_files = sorted(glob.glob(f"{DEV_DIR}/*.parquet"))[:N_SAMPLE]
+dev_labels = pd.read_csv("C:/Users/Roopsundar/OneDrive/Desktop/project/Python/dev_pack/dev_labels.csv") #'''change the dir'''
+dev_truth = pd.read_csv("C:/Users/Roopsundar/OneDrive/Desktop/project/Python/dev_pack/dev_truth.csv")   #'''change the dir'''
+
+dev_rows = []
+for i, path in enumerate(dev_files, 1):
+    sid = os.path.basename(path)[:-8]
+    kepid = int(sid.replace("KIC_", ""))
+    t_i, f_i, q_i = iterative_clean(pd.read_parquet(path))
+    if t_i is None:
+        row = {c: np.nan for c in FEATURE_COLS}
+    else:
+        cand = search(t_i, f_i)
+        row = extract_features(t_i, f_i, q_i, cand)
+    row["star_id"], row["kepid"] = sid, kepid
+    dev_rows.append(row)
+    print(f"  [Dev {i}/{len(dev_files)}] {sid} SDE {row.get('sde', 0):.1f}", flush=True)
+
+dev_feat = pd.DataFrame(dev_rows)
+dev_feat = dev_feat.merge(dev_labels[["kepid", "label"]], on="kepid", how="left")
+dev_feat = dev_feat.merge(dev_truth[["kepid", "injected"]], on="kepid", how="left")
+dev_feat["injected"] = dev_feat.injected.fillna(0)
+dev_feat["has_planet"] = ((dev_feat.label == 1) | (dev_feat.injected == 1)).astype(int)
+dev_feat["confidence"] = clf.predict_proba(dev_feat[FEATURE_COLS])[:, 1]
+
+precisions, recalls, thresholds = precision_recall_curve(dev_feat.has_planet, dev_feat.confidence)
+f1s = np.where(precisions[:-1] + recalls[:-1] > 0,
+               2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-9), 0)
+best_i = int(np.nanargmax(f1s))
+CONFIDENCE_THRESHOLD = float(thresholds[best_i])
+
+ap = average_precision_score(dev_feat.has_planet, dev_feat.confidence)
+print(f"\nChosen Threshold: {CONFIDENCE_THRESHOLD:.3f}")
+print(f"F1: {f1s[best_i]:.3f} | Precision: {precisions[best_i]:.3f} | Recall: {recalls[best_i]:.3f}")
+print(f"PR-AUC / Average Precision: {ap:.3f}")
+
+def run_split(directory):
+    out = []
+    paths = sorted(glob.glob(f"{directory}/*.parquet"))
+    
+    if len(paths) == 0:
+        print(f"\n❌ ERROR: No .parquet files found in directory: {directory}")
+        print("Please check your PRIVATE_DIR path assignment string closely.")
+        return pd.DataFrame()
+
+    for i, path in enumerate(paths, 1):
+        sid = os.path.basename(path)[:-8]
+        try:
+            t_i, f_i, q_i = iterative_clean(pd.read_parquet(path))
+            if t_i is None:
+                raise ValueError("Too few good cadences available")
+            cand = search(t_i, f_i)
+            feat_row = extract_features(t_i, f_i, q_i, cand)
+            conf = float(clf.predict_proba(pd.DataFrame([feat_row])[FEATURE_COLS])[0, 1])
+        except Exception as e:
+            print(f"  Star {sid} analysis failed: {e}")
+            cand = {"period": np.nan, "depth_ppm": np.nan, "duration_hours": np.nan, "sde": 0.0}
+            conf = 0.0
+
+        hit = conf > CONFIDENCE_THRESHOLD
+        
+        out.append({
+            "star_id": sid,
+            "prediction": int(hit),
+            "confidence": round(conf, 4),
+            "period": round(cand["period"], 5) if hit else None,
+            "depth_ppm": round(cand["depth_ppm"], 1) if hit else None,
+            "duration_hours": round(cand["duration_hours"], 3) if hit else None,
+        })
+        if i % 10 == 0 or i == len(paths):
+            print(f"  [Private Processing Progress: {i}/{len(paths)}]", flush=True)
+            
+    return pd.DataFrame(out)
+
+sub = run_split(PRIVATE_DIR)
+
+if not sub.empty:
+    OUTPUT_FILENAME = "submission_phantom.csv"
+    
+    sub.to_csv(OUTPUT_FILENAME, index=False)
+    print(f"\nCompleted! {len(sub)} stars processed. Detected {sub['prediction'].sum()} planet candidates.")
+
+    try:
+        s = pd.read_csv(OUTPUT_FILENAME)
+        need = ["star_id", "prediction", "confidence", "period", "depth_ppm", "duration_hours"]
+        assert list(s.columns) == need, f"Columns must be exactly {need}"
+        assert len(s) == 87, f"Expected 87 rows, got {len(s)}"
+        assert s.star_id.nunique() == 87, "Duplicate star_id detected"
+        assert s.star_id.str.match(r"^STAR_\d{4}$").all(), "Bad star_id format encountered"
+        assert s.prediction.isin([0, 1]).all(), "Predictions field values must be binary (0 or 1)"
+        assert s.confidence.between(0, 1).all(), "Confidence ranges must fall strictly within [0, 1]"
+        
+        pos = s[s.prediction == 1]
+        for c in ("period", "depth_ppm", "duration_hours"):
+            assert pos[c].notna().all(), f"Science parameter '{c}' must not be null when prediction=1"
+            
+        print("🎉 Submission verified successfully without formatting issues!")
+    except Exception as check_error:
+        print(f"⚠️ Warning - Output format check caught an issue: {check_error}")
