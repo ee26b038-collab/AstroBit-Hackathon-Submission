@@ -18,9 +18,6 @@ TRAIN_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\train_pack\tra
 DEV_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\dev_pack\dev"
 PRIVATE_DIR = r"C:\Users\Roopsundar\OneDrive\Desktop\project\Python\private"
 
-'''---------------------------------------------------------------------------------------------------------------------------------------
-to visualize the light curve, we can plot the flux against time. We will only plot the good quality data points (where quality == 0).
----------------------------------------------------------------------------------------------------------------------------------------'''
 PERIOD_MIN = 3.0
 PERIOD_MAX = 400.0
 N_COARSE = 20000       
