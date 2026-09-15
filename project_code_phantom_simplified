@@ -371,6 +371,6 @@ if not sub.empty:
         for c in ("period", "depth_ppm", "duration_hours"):
             assert pos[c].notna().all(), f"Science parameter '{c}' must not be null when prediction=1"
             
-        print("🎉 Submission verified successfully without formatting issues!")
+        print("File generated matches with the submission format")
     except Exception as check_error:
-        print(f"⚠️ Warning - Output format check caught an issue: {check_error}")
+        print(f"The generated file does not match the requirements")
